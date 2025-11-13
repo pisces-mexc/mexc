@@ -1,0 +1,125 @@
+package com.mxc.contract.lps.dispatcher.handler;
+
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.collect.Maps;
+
+import com.mxc.contract.lps.dispatcher.emitter.AllUserDataV2Emitter;
+import com.mxc.contract.lps.dispatcher.enums.BusinessType;
+
+import com.mxc.contract.lps.dispatcher.utils.ThreadUtils;
+
+import lombok.extern.slf4j.Slf4j;
+import lombok.val;
+
+import com.alibaba.fastjson.JSON;
+import org.apache.curator.shaded.com.google.common.util.concurrent.RateLimiter;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.concurrent.CustomizableThreadFactory;
+import org.springframework.stereotype.Component;
+
+import com.mxc.contract.core.event.users.OrderChangeEvent;
+import com.mxc.contract.core.model.Contract;
+import com.mxc.contract.lps.dispatcher.consumer.BaseEventWrap;
+import com.mxc.contract.lps.dispatcher.emitter.AllUserDataEmitter;
+import com.mxc.contract.lps.dispatcher.emitter.UserDataBySymbolEmitter;
+import com.mxc.contract.lps.dispatcher.emitter.UserDataEmitter;
+import com.mxc.contract.lps.dispatcher.manager.CopySubManager;
+import com.mxc.contract.lps.dispatcher.model.dto.LpsOrderChangeEvent;
+import com.mxc.contract.lps.dispatcher.utils.CommonConfigUtil;
+import com.mxc.contract.service.MarketCacheService;
+
+import javax.annotation.PostConstruct;
+
+@Slf4j
+@Component
+public class UserOrderChangeEventHandler extends AbstractEventHandler {
+
+    //详见 AutowiredAnnotationBeanPostProcessor.AutowiredFieldElement.inject
+    private final AllUserDataEmitter allUserDataEmitter;
+    private final UserDataEmitter userDataEmitter;
+    private final UserDataBySymbolEmitter userDataBySymbolEmitter;
+
+    private final CopySubManager copySubManager;
+    /*
+        private final ExecutorService exec2;
+        private final ExecutorService exec3;*/
+    private final ExecutorService exec4;
+
+    @Autowired(required = false)
+    private AllUserDataV2Emitter allUserDataV2Emitter;
+
+    @Value("${mxc.contract.events.UserOrderChangeEventHandler.thread.num:10}")
+    private Long num = 10L;
+    private Map<Long, ExecutorService> allUserExec;
+
+
+    public UserOrderChangeEventHandler(MarketCacheService marketCacheService, AllUserDataEmitter allUserDataEmitter,
+        UserDataEmitter userDataEmitter,
+        UserDataBySymbolEmitter userDataBySymbolEmitter, CommonConfigUtil configUtil,
+        CopySubManager copySubManager) {
+        super(marketCacheService, configUtil);
+        this.allUserDataEmitter = allUserDataEmitter;
+        this.userDataEmitter = userDataEmitter;
+        this.userDataBySymbolEmitter = userDataBySymbolEmitter;
+        this.copySubManager = copySubManager;
+        //预计100M
+        if (num != null) {
+            initAllUserExec();
+        }        //预计100M
+        this.exec4 = ThreadUtils.newSingleThreadExecutor("orderChange-handler04-", 102400);
+    }
+
+    @PostConstruct
+    public void initAllUserExec() {
+        allUserExec = Maps.newHashMap();
+        for (long i = 0; i < num; i++) {
+            allUserExec.put(i, ThreadUtils.newSingleThreadExecutor("orderChange-handler-allUser-" + i + "-" , 10240));
+        }
+    }
+    @Override
+    public void onEvent (BaseEventWrap event,long sequence, boolean endOfBatch) throws Exception {
+
+        val data = event.getData();
+        if (data instanceof OrderChangeEvent) {
+            if (allUserExec == null) {
+                initAllUserExec();
+            }
+            CompletableFuture.runAsync(() -> {
+                OrderChangeEvent origin = (OrderChangeEvent) data;
+                Contract contract = getContract(origin.getOrder().getContractId());
+                if (Objects.isNull(contract)) {
+                    log.error("OrderChangeEventHandler 出现脏数据contract is null, origin={}", JSON.toJSON(origin));
+                    return;
+                }
+                Long uid = origin.getOrder().getUid();
+                if (allUserDataV2Emitter != null) {
+                    CompletableFuture.runAsync(() -> {
+                        // 过滤 做市商 与 压测流量
+                        if (marketCacheService.isMarketMaker(uid) || Boolean.TRUE.equals(contract.getIsPressure())) {
+                            return;
+                        }
+                        allUserDataV2Emitter.emit(origin, uid);
+                    }, exec4);
+                }
+                Integer businessType = copySubManager.getBusinessType(uid);
+                CompletableFuture.runAsync(() ->
+                {
+                    allUserDataEmitter.emit(new LpsOrderChangeEvent(origin, contract, businessType));
+
+                }, allUserExec.get(uid % num));
+            });
+        }
+    }
+
+
+}
