@@ -1,0 +1,317 @@
+package com.mxc.contract.lps.dispatcher.consumer;
+
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.TypeReference;
+import com.alibaba.fastjson2.JSONPath;
+import com.alibaba.fastjson2.JSONReader;
+
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
+
+import com.lmax.disruptor.EventTranslatorThreeArg;
+import com.lmax.disruptor.dsl.Disruptor;
+
+import com.mxc.contract.core.BaseEvent;
+import com.mxc.contract.core.emitter.EventEmitterMapping;
+import com.mxc.contract.core.event.market.DealEvent;
+import com.mxc.contract.core.event.market.DepthEvent;
+import com.mxc.contract.core.event.settlements.OrderDealEvent;
+import com.mxc.contract.core.event.settlements.PositionFundingEvent;
+import com.mxc.contract.core.event.users.AssetChangeEvent;
+import com.mxc.contract.core.event.users.OrderChangeEvent;
+import com.mxc.contract.core.event.users.PlanOrderChangeEvent;
+import com.mxc.contract.core.event.users.PositionChangeEvent;
+import com.mxc.contract.core.event.users.StopPlanOrderChangeEvent;
+import com.mxc.contract.core.model.Contract;
+import com.mxc.contract.core.model.ContractOrder;
+import com.mxc.contract.core.model.ContractPlanOrder;
+import com.mxc.contract.core.model.ContractPosition;
+import com.mxc.contract.core.model.ContractStopPlanOrder;
+import com.mxc.contract.core.serialization.SerializationUtil;
+import com.mxc.contract.core.utils.HeaderUtils;
+import com.mxc.contract.service.MarketCacheService;
+import com.mxc.contract.service.RedisConfigService;
+
+import io.micrometer.core.instrument.Metrics;
+import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.Timer;
+
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.tuple.Pair;
+
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.PartitionInfo;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.header.Headers;
+import org.springframework.beans.factory.InitializingBean;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+import org.springframework.util.CollectionUtils;
+
+import javax.annotation.PostConstruct;
+import java.time.Duration;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Properties;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
+import static com.mxc.contract.core.utils.HeaderUtils.HEADER_VERSION_PROTO;
+
+/**
+ * 信息消费
+ *
+ * @author cooc
+ **/
+@Slf4j
+@Component
+public class UserAllEventConsumer {
+
+    private static final EventTranslatorThreeArg<BaseEventWrap, BaseEvent, Long, Long> TRANSLATOR = (event, sequence, arg0, arg1, arg2)->{
+        event.setData(arg0);
+        event.setOffset(arg1);
+        event.setTs(arg2);
+    };
+    private final String METRICS_NAME_PRE = "mxc.contract.lps.dispatcher.event.";
+
+    private final String encoding = "UTF8";
+
+
+    private final String groupId;
+    private final String maxPollRecords;
+    private final String threadName;
+    private final String servers;
+    private final String eventTopic;
+    private final int commitIntervalMs;
+
+    private final Disruptor<BaseEventWrap> disruptor;
+    private final HashMap<String, TypeReference<?>> typeMap;
+    private final JSONPath typePath = JSONPath.of("$.type");
+    private final MarketCacheService marketCacheService;
+    // private Executor executor;
+
+    @Autowired
+    private RedisConfigService redisConfigService;
+    private ExecutorService executorService;
+    @Value("${mxc.contract.events.UserOrderChangeEventHandler.AbstractEventConsumer.thread.num:10}")
+    private Long num = 10L;
+    BlockingQueue<Pair<Long, CompletableFuture<BaseEvent>>> queue = new LinkedBlockingQueue<>(10000);
+
+    AtomicLong seq = new AtomicLong(0);
+    long nextSeqToOutput = 0;
+    Map<Long, CompletableFuture<BaseEvent>> buffer = new HashMap<>();
+
+    Timer timer = Timer.builder("lps.dispatcher.consumer.AbstractEventConsumer.time")
+        .publishPercentiles(0.5, 0.9, 0.95, 0.99)
+        .publishPercentileHistogram()
+        .distributionStatisticExpiry(Duration.ofMinutes(1))
+        .register(Metrics.globalRegistry);
+
+    public UserAllEventConsumer(
+        @Value("${kafka.bootstrap.servers}") String servers,
+        @Value("${mxc.contract.events.userEvent2Topic}")String eventTopic,
+        @Value("${mxc.contract.events.lpsTopicGroupId:mxc-contract-lps-dispatcher}") String groupId,
+        @Value("${mxc.contract.events.maxPollRecords.userEvent:7000}") String maxPollRecords,
+        @Value("${mxc.contract.dispatcher.commitInterval:1000}")int commitIntervalMs,
+        @Autowired Disruptor<BaseEventWrap> userDisruptor,
+        @Autowired MarketCacheService marketCacheService) {
+        this.threadName = "user3";
+        this.servers = servers;
+        this.eventTopic = eventTopic;
+        this.groupId = groupId;
+        this.maxPollRecords = maxPollRecords;
+        this.commitIntervalMs = commitIntervalMs;
+        this.disruptor = userDisruptor;
+        this.typeMap = new HashMap<>(){{
+            put(AssetChangeEvent.class.getName(), new TypeReference<BaseEventWrapper<AssetChangeEvent>>() {});
+            put(OrderChangeEvent.class.getName(), new TypeReference<BaseEventWrapper<OrderChangeEvent>>() {});
+            put(OrderDealEvent.class.getName(), new TypeReference<BaseEventWrapper<OrderDealEvent>>() {});
+            put(PlanOrderChangeEvent.class.getName(), new TypeReference<BaseEventWrapper<PlanOrderChangeEvent>>() {});
+            put(PositionChangeEvent.class.getName(), new TypeReference<BaseEventWrapper<PositionChangeEvent>>() {});
+            put(StopPlanOrderChangeEvent.class.getName(), new TypeReference<BaseEventWrapper<StopPlanOrderChangeEvent>>() {});
+        }};
+        this.marketCacheService = marketCacheService;
+    }
+
+    @PostConstruct
+    public void initStart() {
+        List<PartitionInfo> partitions = createConsumerForPartition().partitionsFor(eventTopic);
+        for (PartitionInfo pi : partitions) {
+            startPartitionThread(pi.partition());
+        }
+    }
+
+    private void onEvent(byte[] value, long offset, Headers headers) {
+        long start = System.currentTimeMillis();
+        try {
+            BaseEvent event = null;
+            int headerVersion = HeaderUtils.getHeaderVersion(headers);
+            if (headerVersion == HEADER_VERSION_PROTO) {
+                String code = HeaderUtils.getHeaderVal(headers, HeaderUtils.HEADER_TYPE_KEY);
+                Class<? extends BaseEvent> clazz = EventEmitterMapping.getClass(code);
+                if(Objects.isNull(clazz) || !typeMap.containsKey(clazz.getName())) {
+                    return;
+                }
+                event = SerializationUtil.deserializeFromByte(value, clazz);
+            } else {
+                String type = (String) typePath.extract(JSONReader.of(value));
+                if (StringUtils.isBlank(type)) {
+                    log.warn("type is blank. value={}", new String(value));
+                    return;
+                }
+                TypeReference<?> typeReference = typeMap.get(type);
+                if (typeReference == null) {
+                    return;
+                }
+                BaseEventWrapper<BaseEvent> wrapper = JSON.parseObject(value, typeReference.getType());
+                if (Objects.isNull(wrapper) || Objects.isNull(event = wrapper.getEvent())) {
+                    log.warn("eventValue is blank. value={}", new String(value));
+                    return;
+                }
+            }
+
+            //如果消息需要被移除，那么不往disruptor派发消息
+            if (messageNeedRemove(event)){
+                return;
+            }
+            // 如果开启压测则过滤掉压测合约 平时不走此过滤
+            if (redisConfigService.getBoolean("mxc_contract_lps_abstractEvent_filter_switch", false)) {
+                Integer contractId = getCoutractId(event);
+                if (contractId != null) {
+                    Contract contract = marketCacheService.getContract(contractId);
+                    if (contract != null && Boolean.TRUE.equals(contract.getIsPressure())) {
+                        Metrics.counter("mxc.contract.lps.abstractEvent.filter", "contractId", String.valueOf(contractId)).increment();
+                        return;
+                    }
+                }
+            }
+            timer.record(System.currentTimeMillis() - start, TimeUnit.MILLISECONDS);
+
+            Tags tags = Tags.of("topic", eventTopic, "type", event.getClass().getSimpleName());
+            Timer.builder(METRICS_NAME_PRE + "kafka.delay")
+                .tags("type", event.getClass().getSimpleName())
+                .publishPercentiles(0.5, 0.9, 0.95, 0.99)
+                .publishPercentileHistogram()
+                .distributionStatisticExpiry(Duration.ofMinutes(1))
+                .register(Metrics.globalRegistry)
+                .record(System.currentTimeMillis() - event.getTimestamp(), TimeUnit.MILLISECONDS);
+            Metrics.counter(METRICS_NAME_PRE + threadName + ".handler.size", tags).increment(1);
+            BaseEvent finalEvent = event;
+            Metrics.timer(METRICS_NAME_PRE + threadName + ".handler.timer", tags)
+                .record(() -> disruptor.publishEvent(TRANSLATOR, finalEvent, offset, System.currentTimeMillis()));
+        } catch (Exception e) {
+            //数据异常则跳过该条数据
+            log.error(threadName + "EVENT-CONSUMER Exception. offset={}, event={}", offset,
+                new String(value), e);
+            Metrics.counter(METRICS_NAME_PRE + threadName + ".handler.fail", "topic", eventTopic).increment(1);
+        }
+    }
+
+    private Integer getCoutractId(BaseEvent event) {
+        if (event == null) {
+            // 数据为空不处理
+        } else if (event instanceof AssetChangeEvent || event instanceof PositionFundingEvent) {
+            // AssetChangeEvent没有合约相关信息可以考虑后续添加 PositionFundingEvent暂不处理
+        } else if (event instanceof OrderChangeEvent) {
+            ContractOrder order = ((OrderChangeEvent) event).getOrder();
+            if (order != null) return order.getContractId();
+        } else if (event instanceof OrderDealEvent) {
+            OrderDealEvent orderDealEvent = (OrderDealEvent) event;
+            if (!CollectionUtils.isEmpty(orderDealEvent.getOrderDeals())) {
+                return orderDealEvent.getOrderDeals().get(0).getContractId();
+            }
+        } else if (event instanceof PlanOrderChangeEvent) {
+            ContractPlanOrder order = ((PlanOrderChangeEvent) event).getTriggerOrder();
+            if (order != null) return order.getContractId();
+        } else if (event instanceof PositionChangeEvent) {
+            ContractPosition position = ((PositionChangeEvent) event).getPosition();
+            if (position != null) return position.getContractId();
+        } else if (event instanceof StopPlanOrderChangeEvent) {
+            ContractStopPlanOrder order = ((StopPlanOrderChangeEvent) event).getStopPlanOrder();
+            if (order != null) return order.getContractId();
+        } else if (event instanceof DepthEvent) {
+            return ((DepthEvent) event).getContractId();
+        } else if (event instanceof DealEvent) {
+            return ((DealEvent) event).getContractId();
+        }
+        return null;
+    }
+
+    private boolean messageNeedRemove(BaseEvent event) {
+        try {
+
+            String clazzName = event.getClass().getSimpleName();
+
+            List<String> removeTypes = marketCacheService.getRemoveEvent();
+
+            return !CollectionUtils.isEmpty(removeTypes) && removeTypes.contains(clazzName);
+        }catch (Exception e){
+            return false;
+        }
+    }
+
+    private void startPartitionThread(int partition) {
+        Thread t = new Thread(() -> {
+            KafkaConsumer<String, byte[]> partitionConsumer = createConsumerForPartition();
+            partitionConsumer.subscribe(Collections.singletonList(eventTopic), new ConsumerRebalanceListener() {
+                @Override
+                public void onPartitionsRevoked(Collection<TopicPartition> collection) {
+                    log.info("UserAllEventConsumer onPartitionsRevoked, partitions:{} ", collection);
+                }
+
+                @Override
+                public void onPartitionsAssigned(Collection<TopicPartition> collection) {
+                    log.info("UserAllEventConsumer onPartitionsAssigned, partitions:{} ", collection);
+                }
+            });
+
+            //  Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
+
+            while (!Thread.interrupted()) {
+                ConsumerRecords<String, byte[]> records = partitionConsumer.poll(Duration.ofMillis(100));
+                if (!records.isEmpty()) {
+                    records.forEach(record -> {
+                        long offset = record.offset();
+                        byte[] eventValue = record.value();
+                        onEvent(eventValue, offset, record.headers());
+                    });
+                }
+            }
+        }, "partition-consumer-" + partition);
+        t.start();
+    }
+
+    // 创建一个新的 consumer 用于指定分区
+    private KafkaConsumer<String, byte[]> createConsumerForPartition() {
+        Properties props = new Properties();
+        props.setProperty("bootstrap.servers", servers);
+        props.setProperty("group.id", groupId);
+        props.setProperty("session.timeout.ms", "30000");
+        props.setProperty("request.timeout.ms", "60000");
+        props.setProperty("max.poll.interval.ms", "60000");
+        props.setProperty("enable.auto.commit", "true");
+        props.setProperty(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, maxPollRecords);
+        props.setProperty("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+        props.setProperty("value.deserializer",
+            org.apache.kafka.common.serialization.ByteArrayDeserializer.class.getName());
+
+        return new KafkaConsumer<>(props);
+    }
+}
+
