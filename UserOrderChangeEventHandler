@@ -53,6 +53,8 @@ public class UserOrderChangeEventHandler extends AbstractEventHandler {
     /*
         private final ExecutorService exec2;
         private final ExecutorService exec3;*/
+    private final ThreadPoolExecutor orderChangeExecutor;
+    private final int orderChangeExecutorQueueCapacity;
     private final ExecutorService exec4;
 
     @Autowired(required = false)
@@ -62,20 +64,37 @@ public class UserOrderChangeEventHandler extends AbstractEventHandler {
     private Long num = 10L;
     private Map<Long, ExecutorService> allUserExec;
 
-
     public UserOrderChangeEventHandler(MarketCacheService marketCacheService, AllUserDataEmitter allUserDataEmitter,
         UserDataEmitter userDataEmitter,
         UserDataBySymbolEmitter userDataBySymbolEmitter, CommonConfigUtil configUtil,
-        CopySubManager copySubManager) {
+        CopySubManager copySubManager,
+        @Value("${mxc.contract.events.UserOrderChangeEventHandler.executor.coreSize:4}") int orderChangeExecutorCoreSize,
+        @Value("${mxc.contract.events.UserOrderChangeEventHandler.executor.maxSize:16}") int orderChangeExecutorMaxSize,
+        @Value("${mxc.contract.events.UserOrderChangeEventHandler.executor.queueCapacity:2048}") int orderChangeExecutorQueueCapacity) {
         super(marketCacheService, configUtil);
         this.allUserDataEmitter = allUserDataEmitter;
         this.userDataEmitter = userDataEmitter;
         this.userDataBySymbolEmitter = userDataBySymbolEmitter;
         this.copySubManager = copySubManager;
+        this.orderChangeExecutorQueueCapacity = orderChangeExecutorQueueCapacity;
         //预计100M
         if (num != null) {
             initAllUserExec();
         }        //预计100M
+        LinkedBlockingQueue<Runnable> queue = new LinkedBlockingQueue<>(orderChangeExecutorQueueCapacity);
+        CallerRunsPolicy callerRunsPolicy = new CallerRunsPolicy();
+        this.orderChangeExecutor = new ThreadPoolExecutor(orderChangeExecutorCoreSize, orderChangeExecutorMaxSize, 60L,
+            TimeUnit.SECONDS, queue, new CustomizableThreadFactory("orderChange-handler-"), (r, executor) -> {
+            int queueSize = executor.getQueue().size();
+            log.error(
+                "orderChangeExecutor rejected task. queueSize={}, poolSize={}, activeCount={}, taskCount={}", queueSize,
+                executor.getPoolSize(), executor.getActiveCount(), executor.getTaskCount());
+            callerRunsPolicy.rejectedExecution(r, executor);
+        });
+        log.info(
+            "Initialized orderChangeExecutor with coreSize={}, maxSize={}, queueCapacity={}",
+            orderChangeExecutorCoreSize,
+            orderChangeExecutorMaxSize, orderChangeExecutorQueueCapacity);
         this.exec4 = ThreadUtils.newSingleThreadExecutor("orderChange-handler04-", 102400);
     }
 
@@ -83,18 +102,30 @@ public class UserOrderChangeEventHandler extends AbstractEventHandler {
     public void initAllUserExec() {
         allUserExec = Maps.newHashMap();
         for (long i = 0; i < num; i++) {
-            allUserExec.put(i, ThreadUtils.newSingleThreadExecutor("orderChange-handler-allUser-" + i + "-" , 10240));
+            allUserExec.put(i, ThreadUtils.newSingleThreadExecutor("orderChange-handler-allUser-" + i + "-", 10240));
         }
     }
+
+    private void submitOrderChangeTask(Runnable task) {
+        if (Objects.nonNull(orderChangeExecutor)) {
+            int queueSize = orderChangeExecutor.getQueue().size();
+            if (orderChangeExecutorQueueCapacity > 0 && queueSize >= orderChangeExecutorQueueCapacity * 4 / 5) {
+                log.warn("orderChangeExecutor queue usage high. size={}, capacity={}", queueSize,
+                    orderChangeExecutorQueueCapacity);
+            }
+        }
+        CompletableFuture.runAsync(task, orderChangeExecutor);
+    }
+
     @Override
-    public void onEvent (BaseEventWrap event,long sequence, boolean endOfBatch) throws Exception {
+    public void onEvent(BaseEventWrap event, long sequence, boolean endOfBatch) throws Exception {
 
         val data = event.getData();
         if (data instanceof OrderChangeEvent) {
             if (allUserExec == null) {
                 initAllUserExec();
             }
-            CompletableFuture.runAsync(() -> {
+            submitOrderChangeTask(() -> {
                 OrderChangeEvent origin = (OrderChangeEvent) data;
                 Contract contract = getContract(origin.getOrder().getContractId());
                 if (Objects.isNull(contract)) {
@@ -120,6 +151,4 @@ public class UserOrderChangeEventHandler extends AbstractEventHandler {
             });
         }
     }
-
-
 }
